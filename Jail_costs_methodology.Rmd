@@ -1,0 +1,277 @@
+# How much extra money is it costing local taxpayers for the court failing to meet its own timetables for murder and attempted murder?
+## by Joe Mahr/ Chicago Tribune
+
+```{r setup, echo=T, error=F, results=F, message=F, warning=F}
+library(knitr)
+opts_chunk$set(out.width="900px", dpi=300)
+```
+
+This analysis uses [R](https://www.r-project.org/) code, with source data from the Cook County Sheriff's Office, which was obtained through an open-records request and slightly modified here to redact identifying information. Two caveats:   
+* The sheriff's office data did not separate those accused of murder from those accused of attempted murder. So I created a special conversion file to limit the analysis to those just charged with first-degree murder.    
+* The court's goal is to complete each murder case within two years of arraignment. Unfortunately the jail data doesn't include an arraignment date. So I had to estimate that, based on the median from prosecutors' data, on how many days had typically elapsed between an arrest and arraignment. (Although each individual case may be a few days off by using an estimate, the idea is that, overall, the total costs will hold true because any small differences will even out.)    
+This analysis calculates, for every day beyond that two-year goal, how much taxpayers had to pay to house each defendant in the county jail.
+
+### **Getting the data**
+
+You'll need to create a folder called raw_data in your working directory, and dump into that folder files from this [Google drive folder](https://drive.google.com/drive/folders/11QiBorF_GVX85oHQdmI8pbOkU5wFjOMj?usp=sharing).
+
+In that drive folder, I've included three files from the sheriff's office:   
+   -Inmate_demographics (which I de-identified)     
+   -Inmate_housing   
+   -Inmate_charges
+   
+There's one file from the state's attorney's office:   
+   -SA_dispositions   
+   
+And there's one file I created to narrow the sheriff's data to only those charged with first-degree murder:    
+   -Jail_charge_conversion   
+
+The sheriff's data is current through Sept. 1. The state's attorney data is current through Jan. 23.
+
+One final note: The sheriff's office provided me data on how much it cost to house each inmate, in various fiscal years. It is embedded in later code, but for reference the average daily cost was 162 in FY 14, rising to 189 in FY 15 and 240 in FY 18. (And, in Cook County, each fiscal year begins Dec. 1, and on that date is given the numerical equivalent of the next calendar year. So FY 14 began on Dec. 1, 2013, and ran through Nov. 30, 2014.)
+
+```{r loading, warning=F, message=F, results=F}
+
+# List of packages for session
+.packages = c("tidyverse", "lubridate")
+
+# Install CRAN packages (if not already installed)
+.inst <- .packages %in% installed.packages()
+if(length(.packages[!.inst]) > 0) install.packages(.packages[!.inst])
+
+# Load packages into session 
+lapply(.packages, require, character.only=TRUE)
+
+#Here is our raw data, which we pull from our working directory:
+Inmate_demographics_raw <- read_csv("raw_data/Inmate_demographics.csv",show_col_types = FALSE)
+Inmate_housing_raw <- read_csv("raw_data/Inmate_housing.csv",show_col_types = FALSE)
+Inmate_charges_raw <- read_csv("raw_data/Inmate_charges.csv",show_col_types = FALSE)
+SA_dispositions <- read_csv("raw_data/SA_dispositions.csv",show_col_types = FALSE)
+Jail_charge_conversion_raw <- read_csv("raw_data/Jail_charge_conversion.csv",show_col_types = FALSE)
+
+```
+
+### **Preparing the data**
+
+The first part of preparing the data involved computing the median number of days between an arrest and an arraignment, which we'll need to help compute a date to start the clock rolling on the court meeting its two-year goal.
+
+```{r, results=F, message=F, warning=F}
+
+Median_arraignment_days_from_arrest <- SA_dispositions %>% 
+  #This grabs murder cases
+  filter(DISPOSITION_CHARGED_CLASS=="M") %>% 
+  #This slims to just fields we care about:
+  select(CASE_ID, CASE_PARTICIPANT_ID,ARREST_DATE,ARRAIGNMENT_DATE) %>% 
+  #This eliminates cases that do not contain both sets of data:
+  filter(!is.na(ARREST_DATE)) %>% 
+  filter(!is.na(ARRAIGNMENT_DATE)) %>% 
+  #This cleans up each date field, and then ensures, if there duplicates, we take the earliest instance of each field no duplicates:
+  mutate(ARREST_DATE=as.Date(mdy_hms(ARREST_DATE))) %>%
+  mutate(ARRAIGNMENT_DATE=as.Date(mdy_hms(ARRAIGNMENT_DATE))) %>% 
+  group_by(CASE_ID, CASE_PARTICIPANT_ID) %>% 
+  summarize(ARREST_DATE=min(ARREST_DATE),
+            ARRAIGNMENT_DATE=min(ARRAIGNMENT_DATE)) %>% 
+  #This takes cases in the same timeframe in which we're studying jail inmates:
+  filter(ARREST_DATE>="2012-01-01" &
+           ARREST_DATE<="2022-09-01") %>% 
+  #This computes the days between each event in each case:
+  mutate(difference=difftime(ARRAIGNMENT_DATE,ARREST_DATE,units="days")) %>% 
+  #This provides our median:
+  ungroup() %>% 
+  select(difference) %>% 
+  summarize(median=median(difference))
+
+#The median is 42 days between arrest (booking) and arraignment. So we'll add that to the earliest booking dates for each case
+
+```
+
+The next portion of preparation involved limiting the list of inmates to those booked in 2012 or later for first-degree murder, and were confined at some point.
+
+```{r, results=F, message=F, warning=F}
+
+#Step One: This creates a file of all those booked into jail for first-degree murder after 1/1/2012 AND who were not booked out for at least two years, then computes an assumed arraignment date:
+
+Step_One <- Inmate_charges_raw %>% 
+  #After starting with charges against inmates, this limits to just those charged with first-degree murder, based on the guide I created:
+  left_join(Jail_charge_conversion_raw) %>% 
+  filter(FDM=="x") %>% 
+  select(bookingid) %>% 
+  #This slims down to just the booking ID of anyone charged with first-degree murder:
+  distinct() %>% 
+  #This pulls demo info just for this group:
+  left_join(Inmate_demographics_raw) %>% 
+  #This filters for people booked in 2012 or after
+  filter(booking_date>="2012-01-01") %>% 
+  #This filters for people in custody at least two years (Jail_LOS means jail length of stay)
+  filter(jail_LOS>(365.25*2)) %>% 
+  select(inmateid, jail_LOS) %>% 
+  group_by(inmateid) %>% 
+  #This limits the file to one line per inmate, taking the longest custody time
+  summarize(jail_LOS=max(jail_LOS)) %>% 
+  #This brings us back other fields of data we may want on that inmate's longest custody booking
+  left_join(Inmate_demographics_raw %>% select(inmateid,jail_LOS,bookingid,booking_date,release_date), by=c("inmateid","jail_LOS")) %>% 
+  #This adds in an assumed number of days from arrest to arraignment, based on the average length calculated in another crunch, which is XXXX days:
+   mutate(Assumed_arraignment=booking_date+  Median_arraignment_days_from_arrest$median)
+
+#Step two: Just because somebody was under custody of CCSO, it doesn't mean they were literally jailed. Some people posted bond, maybe were brought back in, etc.
+# So the next step is to limit our list to just those inmates who, at some point, were confined for that booking, and then when they were confined:
+
+Step_Two <- Step_One %>% 
+  left_join(Inmate_housing_raw) %>% 
+  filter(Custody_Status=="Confined")
+
+```
+
+Going forward, this analysis gets a little complicated, because I needed to:    
+ a) Figure out the time span of confinement for each inmate    
+ b) Fix lines to do calculation for inmates who were currently confined at the time the data was run, to show 9/1/22 as the "end date")    
+ c) Compute how much of that confinement time was AFTER two years of their arraignment dates    
+ d) And, in computing confinement time, assign how much was in each fiscal year, so I could multiply the days by the calculated daily cost per inmate for that fiscal year.    
+
+```{r, results=F, message=F, warning=F}
+
+Step_Three <- Step_Two %>% 
+  #Let's clean up date fields not already cleaned:
+  mutate(Assign_Start=as.Date(Assign_Start),
+         Assign_End=as.Date(Assign_End)) %>% 
+  #For entries with no end date (who were still in custody at the time of the data release), we'll put Sept. 1, 2022, the most recent date of the data:
+  mutate(Assign_End=if_else(is.na(Assign_End),as_date("2022-09-01"),Assign_End)) %>% 
+  #Let's also adjust that start to be the LATER of the arraignment date (which will be most people, who spent a continuous amount of time in jail after arrest) or the listed assign date (in case someone was released on bond, then came back) %>% 
+  mutate(Assign_Start=if_else(Assumed_arraignment>Assign_Start,Assumed_arraignment,Assign_Start)) %>% 
+  #One more possibility is by adjusting that date, we overshot when someone was released. So we'll adjust the assign start again to be the EARLIEST of what's listed or the end date of confinment for that period:
+   mutate(Assign_Start=if_else(Assign_End>Assign_Start,Assign_Start,Assign_End)) %>%  
+  #Now we can compute the confined days for each line:
+  mutate(Confine_days=difftime(Assign_End,Assign_Start, units="days")) %>% 
+  #Now we need to figure out which confinements we should flag as lasting longer than the court's two-year goal:
+  mutate(Court_goal_date=Assumed_arraignment+years(2)) %>% 
+  #This starts the process to determine how long beyond the court's goal each confinement lasted:
+  mutate(Days_beyond_court_goal=as.numeric(difftime(Assign_End,Court_goal_date,unit="days"))) %>% 
+  #This cleans up any instances where people were released before the court goal date, correcting to zero days beyond court goal:
+  mutate(Days_beyond_court_goal=if_else(Days_beyond_court_goal<0,0,Days_beyond_court_goal)) %>% 
+  #This cleans up any instances where the actual length of confinment was less than the number of days beyond the court goal:
+  mutate(Days_beyond_court_goal=if_else(Days_beyond_court_goal>Confine_days,Confine_days,Days_beyond_court_goal))
+
+#Step Four: This is pretty complicated code and there's probably a MUCH cleaner way to do this (sorry). That said, this below determines the number of days over the goal for each confinement in each fiscal year:
+
+Step_Four <- Step_Three %>% 
+  #The easiest thing we're going to do is eliminate any confinment periods that have 0 days beyond the court goal:
+  filter(Days_beyond_court_goal>0) %>% 
+  #We're going to pick the first possible year there could be an overage (FY14) and then start wtih a baseline assumption that this confinement doesn't have any days to qualify:
+  mutate(FY14_days=0) %>% 
+  #Now let's measure for the chance an overage began in a prior FY and continued into some part of this fiscal year. I'm going to break this line up to explain each part
+  mutate(FY14_days=
+           #this is an if_else through dplyr so the dates don't get messed up, and we're basically saying: If the court was supposed to finish this case in an earlier fiscal year...
+           if_else(Court_goal_date<as.Date("2013-12-01"),
+                   #then figure out if the inmate got out this fiscal year and, if so, subtract the beginning of the fiscal year from that release date, and if not, then subtract the beginning of the fiscal year from the last date of this fiscal year (Example: Inmate's court goal was sometime in FY13, and he/she got released on 6/1/14, then do 6/1/14 - 12/1/13 to get the # of days confined this fiscal year beyond court goal, which would be 182 days. But if this inmate's court goal was in FY 13 but he/ she didn't get out until sometime in FY15, then his total days confined beyond the court goal in FY 14 would be 12/1/14 - 12/1/13, or 365 days) ...
+      (if_else(Assign_End>as.Date("2014-11-30"),as.Date("2014-12-01"),Assign_End)-as.Date("2013-12-01")),FY14_days)) %>% 
+  #Now we'll do something similar with cases where the court goal was within this fiscal year:
+  mutate(FY14_days=if_else(Court_goal_date %within% interval(as.Date("2013-12-01"),as.Date("2014-11-30")),(if_else(Assign_End>as.Date("2014-11-30"),as.Date("2014-12-01"),Assign_End)-Court_goal_date),FY14_days)) %>% 
+  #And now we need to clean up to ensure we do not count any days if a defendant was released before this fiscal year began (Side note: There's a weird error if I don't confirm that FY14_days needs to stay as.numeric, hence that last part in this line):
+  mutate(FY14_days=if_else(Assign_End<as.Date("2013-12-01"),0,as.numeric(FY14_days))) %>% 
+  #Now we'll do the same for FY 15:
+  mutate(FY15_days=0) %>% 
+  mutate(FY15_days=if_else(Court_goal_date<as.Date("2014-12-01"),(if_else(Assign_End>as.Date("2015-11-30"),as.Date("2015-12-01"),Assign_End)-as.Date("2014-12-01")),FY15_days)) %>% 
+  mutate(FY15_days=if_else(Court_goal_date %within% interval(as.Date("2014-12-01"),as.Date("2015-11-30")),(if_else(Assign_End>as.Date("2015-11-30"),as.Date("2015-12-01"),Assign_End)-Court_goal_date),FY15_days)) %>% 
+  mutate(FY15_days=if_else(Assign_End<as.Date("2014-12-01"),0,as.numeric(FY15_days))) %>% 
+  #Now we'll do the same for FY 16:
+  mutate(FY16_days=0) %>% 
+  mutate(FY16_days=if_else(Court_goal_date<as.Date("2015-12-01"),(if_else(Assign_End>as.Date("2016-11-30"),as.Date("2016-12-01"),Assign_End)-as.Date("2015-12-01")),FY16_days)) %>% 
+  mutate(FY16_days=if_else(Court_goal_date %within% interval(as.Date("2015-12-01"),as.Date("2016-11-30")),(if_else(Assign_End>as.Date("2016-11-30"),as.Date("2016-12-01"),Assign_End)-Court_goal_date),FY16_days)) %>% 
+  mutate(FY16_days=if_else(Assign_End<as.Date("2015-12-01"),0,as.numeric(FY16_days))) %>% 
+  #Now we'll do the same for FY 17:
+  mutate(FY17_days=0) %>% 
+  mutate(FY17_days=if_else(Court_goal_date<as.Date("2016-12-01"),(if_else(Assign_End>as.Date("2017-11-30"),as.Date("2017-12-01"),Assign_End)-as.Date("2016-12-01")),FY17_days)) %>% 
+  mutate(FY17_days=if_else(Court_goal_date %within% interval(as.Date("2016-12-01"),as.Date("2017-11-30")),(if_else(Assign_End>as.Date("2017-11-30"),as.Date("2017-12-01"),Assign_End)-Court_goal_date),FY17_days)) %>% 
+  mutate(FY17_days=if_else(Assign_End<as.Date("2016-12-01"),0,as.numeric(FY17_days))) %>% 
+#Now we'll do the same for FY 18:
+  mutate(FY18_days=0) %>% 
+  mutate(FY18_days=if_else(Court_goal_date<as.Date("2017-12-01"),(if_else(Assign_End>as.Date("2018-11-30"),as.Date("2018-12-01"),Assign_End)-as.Date("2017-12-01")),FY18_days)) %>% 
+  mutate(FY18_days=if_else(Court_goal_date %within% interval(as.Date("2017-12-01"),as.Date("2018-11-30")),(if_else(Assign_End>as.Date("2018-11-30"),as.Date("2018-12-01"),Assign_End)-Court_goal_date),FY18_days)) %>% 
+  mutate(FY18_days=if_else(Assign_End<as.Date("2017-12-01"),0,as.numeric(FY18_days))) %>% 
+#Now we'll do the same for FY 19:
+  mutate(FY19_days=0) %>% 
+  mutate(FY19_days=if_else(Court_goal_date<as.Date("2018-12-01"),(if_else(Assign_End>as.Date("2019-11-30"),as.Date("2019-12-01"),Assign_End)-as.Date("2018-12-01")),FY19_days)) %>% 
+  mutate(FY19_days=if_else(Court_goal_date %within% interval(as.Date("2018-12-01"),as.Date("2019-11-30")),(if_else(Assign_End>as.Date("2019-11-30"),as.Date("2019-12-01"),Assign_End)-Court_goal_date),FY19_days)) %>% 
+  mutate(FY19_days=if_else(Assign_End<as.Date("2018-12-01"),0,as.numeric(FY19_days))) %>%   
+#Now we'll do the same for FY 20:
+  mutate(FY20_days=0) %>% 
+  mutate(FY20_days=if_else(Court_goal_date<as.Date("2019-12-01"),(if_else(Assign_End>as.Date("2020-11-30"),as.Date("2020-12-01"),Assign_End)-as.Date("2019-12-01")),FY20_days)) %>% 
+  mutate(FY20_days=if_else(Court_goal_date %within% interval(as.Date("2019-12-01"),as.Date("2020-11-30")),(if_else(Assign_End>as.Date("2020-11-30"),as.Date("2020-12-01"),Assign_End)-Court_goal_date),FY20_days)) %>% 
+  mutate(FY20_days=if_else(Assign_End<as.Date("2019-12-01"),0,as.numeric(FY20_days))) %>%    
+  #Now we'll do the same for FY 21:
+  mutate(FY21_days=0) %>% 
+  mutate(FY21_days=if_else(Court_goal_date<as.Date("2020-12-01"),(if_else(Assign_End>as.Date("2021-11-30"),as.Date("2021-12-01"),Assign_End)-as.Date("2020-12-01")),FY21_days)) %>% 
+  mutate(FY21_days=if_else(Court_goal_date %within% interval(as.Date("2020-12-01"),as.Date("2021-11-30")),(if_else(Assign_End>as.Date("2021-11-30"),as.Date("2021-12-01"),Assign_End)-Court_goal_date),FY21_days)) %>% 
+  mutate(FY21_days=if_else(Assign_End<as.Date("2020-12-01"),0,as.numeric(FY21_days))) %>%    
+  #Now we'll do the same for FY 22:
+  mutate(FY22_days=0) %>% 
+  mutate(FY22_days=if_else(Court_goal_date<as.Date("2021-12-01"),(if_else(Assign_End>as.Date("2022-11-30"),as.Date("2022-12-01"),Assign_End)-as.Date("2021-12-01")),FY22_days)) %>% 
+  mutate(FY22_days=if_else(Court_goal_date %within% interval(as.Date("2021-12-01"),as.Date("2022-11-30")),(if_else(Assign_End>as.Date("2022-11-30"),as.Date("2022-12-01"),Assign_End)-Court_goal_date),FY22_days)) %>% 
+  mutate(FY22_days=if_else(Assign_End<as.Date("2021-12-01"),0,as.numeric(FY22_days)))     
+
+#Yikes, that was a lot of code above. But congrats, you made it. It gets easier from here. The next step is multiplying the days each year, for each confinment, by the average costs of each inmate, as provided by the sheriff's office (and embedded in the code below):
+
+Step_Five <- Step_Four %>% 
+  #this creates new fields to compute each FY's costs:
+    mutate(FY14_costs=FY14_days*162,
+         FY15_costs=FY15_days*189,
+         FY16_costs=FY16_days*189,
+         FY17_costs=FY17_days*189,
+         FY18_costs=FY18_days*240,
+         FY19_costs=FY19_days*240,
+         FY20_costs=FY20_days*240,
+         FY21_costs=FY21_days*240,
+         FY22_costs=FY22_days*240) %>% 
+  #This adds up total costs
+  mutate(Total_costs=FY14_costs+
+           FY15_costs+
+           FY16_costs+
+           FY17_costs+
+           FY18_costs+
+           FY19_costs+
+           FY20_costs+
+           FY21_costs+
+           FY22_costs) %>% 
+  #This adds up total days
+  mutate(Total_days=FY14_days+
+           FY15_days+
+           FY16_days+
+           FY17_days+
+           FY18_days+
+           FY19_days+
+           FY20_days+
+           FY21_days+
+           FY22_days) %>% 
+  #This sums up for each inmate the costs and extra days (noting that some inmates had multiple confinements)
+  select(inmateid,Total_costs,Total_days) %>% 
+  group_by(inmateid) %>% 
+  summarize(Total_costs=sum(Total_costs),
+            Total_days=sum(Total_days))
+
+```
+
+### **Analyzing the data**
+
+The hard part was computing the days and costs for each inmate. The easy part is adding it up to determine a total cost.
+
+```{r, results=F, message=F, warning=F}
+
+Final_jail_tally <- Step_Five %>% 
+  ungroup() %>% 
+  select(Total_costs,Total_days) %>% 
+  summarize(Total_costs=sum(Total_costs),
+            Total_days=sum(Total_days))
+
+#This final data is saved in Final_data folder
+
+
+#This formats it for a chart:
+
+Final_jail_tally_chart <- Final_jail_tally %>% 
+  mutate(Total_costs=paste("$",format(Final_jail_tally$Total_costs, big.mark=","),sep="")) %>% 
+  mutate(Total_days=paste(format(Final_jail_tally$Total_days, big.mark=","),sep="")) 
+
+kable(Final_jail_tally_chart)
+
+```
+
