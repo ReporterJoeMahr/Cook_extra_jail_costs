@@ -1,4 +1,4 @@
-# How much extra money is it costing local taxpayers for the court failing to meet its own timetables for murder and attempted murder?
+# How much extra money is it costing local taxpayers for the court failing to meet its own timetables for murder?
 ## by Joe Mahr/ Chicago Tribune
 
 ```{r setup, echo=T, error=F, results=F, message=F, warning=F}
